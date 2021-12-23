@@ -27,6 +27,7 @@
  */
 
 
+/*global setSelections, setBoundingBox, moveBoundingBox, bounding_box */
 // Init variables
 var dragging = false;
 var resize_disabled = false;
@@ -54,6 +55,12 @@ App.directive("tlClip", function ($timeout) {
         maxWidth: scope.clip.length * scope.pixelsPerSecond,
         start: function (e, ui) {
           dragging = true;
+
+          // Set selections
+          setSelections(scope, element, $(this).attr("id"));
+
+          // Set bounding box
+          setBoundingBox(scope, $(this), "trimming");
 
           //determine which side is being changed
           var parentOffset = element.offset();
@@ -92,6 +99,9 @@ App.directive("tlClip", function ($timeout) {
             return;
           }
 
+          // Hide snapline (if any)
+          scope.hideSnapline();
+
           // Hide keyframe points
           if (dragLoc === "right") {
             // Make the keyframe points visible again
@@ -100,7 +110,7 @@ App.directive("tlClip", function ($timeout) {
           }
 
           //get amount changed in width
-          var delta_x = ui.originalSize.width - ui.size.width;
+          var delta_x = ui.originalSize.width - ui.element.width();
           var delta_time = delta_x / scope.pixelsPerSecond;
 
           //change the clip end/start based on which side was dragged
@@ -131,12 +141,7 @@ App.directive("tlClip", function ($timeout) {
 
           //apply the new start, end and length to the clip's scope
           scope.$apply(function () {
-            // Get the nearest starting frame position to the clip position (this helps to prevent cutting
-            // in-between frames, and thus less likely to repeat or skip a frame).
-            new_position = (Math.round((new_position * scope.project.fps.num) / scope.project.fps.den) * scope.project.fps.den ) / scope.project.fps.num;
-            new_right = (Math.round((new_right * scope.project.fps.num) / scope.project.fps.den) * scope.project.fps.den ) / scope.project.fps.num;
-            new_left = (Math.round((new_left * scope.project.fps.num) / scope.project.fps.den) * scope.project.fps.den ) / scope.project.fps.num;
-
+            // Apply clip scope changes
             if (scope.clip.end !== new_right) {
               scope.clip.end = new_right;
             }
@@ -146,12 +151,13 @@ App.directive("tlClip", function ($timeout) {
             }
             // Resize timeline if it's too small to contain all clips
             scope.resizeTimeline();
-
-            // update clip in Qt (very important =)
-            if (scope.Qt) {
-              timeline.update_clip_data(JSON.stringify(scope.clip), true, true, false);
-            }
           });
+
+          // update clip in Qt (very important =)
+          if (scope.Qt) {
+            timeline.update_clip_data(JSON.stringify(scope.clip), true, true, false);
+          }
+
           //resize the audio canvas to match the new clip width
           if (scope.clip.show_audio) {
             //redraw audio as the resize cleared the canvas
@@ -167,36 +173,51 @@ App.directive("tlClip", function ($timeout) {
             return;
           }
 
-          // get amount changed in width
-          var delta_x = parseFloat(ui.originalSize.width) - ui.size.width;
-          var delta_time = delta_x / scope.pixelsPerSecond;
+          // Calculate the clip bounding box movement and apply snapping rules
+          let cursor_position = e.pageX - $("#ruler").offset().left;
+          let results = moveBoundingBox(scope, bounding_box.left, bounding_box.top,
+            cursor_position - bounding_box.left, cursor_position - bounding_box.top,
+            cursor_position, cursor_position, "trimming");
 
-          // change the clip end/start based on which side was dragged
-          var new_left = scope.clip.start;
-          var new_right = scope.clip.end;
+          // Calculate delta from current mouse position
+          let new_position = cursor_position;
+          new_position = results.position.left;
+          let delta_x = 0;
+          if (dragLoc === "left") {
+            delta_x = (parseFloat(ui.originalPosition.left)) - new_position;
+          } else if (dragLoc === "right") {
+            delta_x = (parseFloat(ui.originalPosition.left) + parseFloat(ui.originalSize.width)) - new_position;
+          }
+
+          // Calculate the pixel locations of the left and right side
+          var new_left = scope.clip.start * scope.pixelsPerSecond;
+          var new_right = scope.clip.end * scope.pixelsPerSecond;
 
           if (dragLoc === "left") {
-            // changing the start of the clip
-            new_left += delta_time;
-            if (new_left < 0) {
-              ui.element.width(ui.size.width + (new_left * scope.pixelsPerSecond));
-              ui.element.css("left", ui.position.left - (new_left * scope.pixelsPerSecond));
+            // Adjust left side of clip
+            // Don't allow less than 0.0 start
+            let zero_left_x = (scope.clip.position - scope.clip.start) * scope.pixelsPerSecond;
+            let proposed_left_x = ui.originalPosition.left - delta_x;
+            if (proposed_left_x < zero_left_x) {
+              // prevent less than 0.0
+              delta_x = ui.originalPosition.left - zero_left_x;
             }
-            else {
-              ui.element.width(ui.size.width);
-            }
+
+            // Position and size clip
+            ui.element.css("left", ui.originalPosition.left - delta_x);
+            ui.element.width(new_right - (new_left - delta_x));
           }
           else {
-            // changing the end of the clips
-            new_right -= delta_time;
-            if (new_right > scope.clip.duration) {
-
+            // Adjust right side of clip
+            new_right -= delta_x;
+            let duration_pixels = scope.clip.duration * scope.pixelsPerSecond;
+            if (new_right > duration_pixels) {
               // change back to actual duration (for the preview below)
-              new_right = scope.clip.duration;
-              ui.element.width(new_right * scope.pixelsPerSecond);
+              new_right = duration_pixels;
+              ui.element.width(new_right);
             }
             else {
-              ui.element.width(ui.size.width);
+              ui.element.width((new_right - new_left));
             }
           }
 
@@ -232,35 +253,13 @@ App.directive("tlClip", function ($timeout) {
         snapMode: "inner",
         snapTolerance: 20,
         scroll: true,
-        cancel: ".effect-container,.clip_menu",
+        cancel: ".effect-container,.clip_menu,.point",
         start: function (event, ui) {
           previous_drag_position = null;
           dragging = true;
-          if (!element.hasClass("ui-selected")) {
-            // Clear previous selections?
-            var clear_selections = false;
-            if ($(".ui-selected").length > 0) {
-              clear_selections = true;
-            }
 
-            // selectClip, selectTransition
-            var id = $(this).attr("id");
-            if (element.hasClass("clip")) {
-              // Select this clip, unselect all others
-              scope.selectTransition("", clear_selections);
-              scope.selectClip(id, clear_selections);
-
-            }
-            else if (element.hasClass("transition")) {
-              // Select this transition, unselect all others
-              scope.selectClip("", clear_selections);
-              scope.selectTransition(id, clear_selections);
-            }
-          }
-
-          // Apply scope up to this point
-          scope.$apply(function () {
-          });
+          // Set selections
+          setSelections(scope, element, $(this).attr("id"));
 
           var scrolling_tracks = $("#scrolling_tracks");
           var vert_scroll_offset = scrolling_tracks.scrollTop();
@@ -270,7 +269,8 @@ App.directive("tlClip", function ($timeout) {
           bounding_box = {};
 
           // Init all other selected clips (prepare to drag them)
-          $(".ui-selected").each(function () {
+          // This creates a bounding box which contains all selected clips
+          $(".ui-selected, #" + $(this).attr("id")).each(function () {
             // Init all clips whether selected or not
             start_clips[$(this).attr("id")] = {
               "top": $(this).position().top + vert_scroll_offset,
@@ -291,11 +291,6 @@ App.directive("tlClip", function ($timeout) {
           }
         },
         stop: function (event, ui) {
-          // Ignore clip-menu click
-          $(event.toElement).one(".clip_menu", function (e) {
-            e.stopImmediatePropagation();
-          });
-
           // Hide snapline (if any)
           scope.hideSnapline();
 
@@ -330,14 +325,16 @@ App.directive("tlClip", function ($timeout) {
 
           // Move all other selected clips with this one if we have more than one clip
           $(".ui-selected").each(function () {
-            var newY = move_clips[$(this).attr("id")]["top"] + y_offset;
-            var newX = move_clips[$(this).attr("id")]["left"] + x_offset;
-            //update the clip location in the array
-            move_clips[$(this).attr("id")]["top"] = newY;
-            move_clips[$(this).attr("id")]["left"] = newX;
-            //change the element location
-            $(this).css("left", newX);
-            $(this).css("top", newY);
+            if (move_clips[$(this).attr("id")]) {
+              let newY = move_clips[$(this).attr("id")]["top"] + y_offset;
+              let newX = move_clips[$(this).attr("id")]["left"] + x_offset;
+              //update the clip location in the array
+              move_clips[$(this).attr("id")]["top"] = newY;
+              move_clips[$(this).attr("id")]["left"] = newX;
+              //change the element location
+              $(this).css("left", newX);
+              $(this).css("top", newY);
+            }
           });
         },
         revert: function (valid) {
@@ -373,7 +370,7 @@ App.directive("tlMultiSelectable", function () {
       element.selectable({
         filter: ".droppable",
         distance: 0,
-        cancel: ".effect-container,.transition_menu,.clip_menu",
+        cancel: ".effect-container,.transition_menu,.clip_menu,.point",
         selected: function (event, ui) {
           // Identify the selected ID and TYPE
           var id = ui.selected.id;

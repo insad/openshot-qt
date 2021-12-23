@@ -33,6 +33,7 @@ from PyQt5.QtCore import QSize, Qt, QPoint
 from PyQt5.QtGui import QDrag, QCursor
 from PyQt5.QtWidgets import QTreeView, QAbstractItemView, QMenu, QSizePolicy, QHeaderView
 
+from classes import info
 from classes.app import get_app
 from classes.logger import log
 from classes.query import File
@@ -40,7 +41,8 @@ from classes.query import File
 
 class FilesTreeView(QTreeView):
     """ A TreeView QWidget used on the main window """
-    drag_item_size = 48
+    drag_item_size = QSize(48, 48)
+    drag_item_center = QPoint(24, 24)
 
     def contextMenuEvent(self, event):
 
@@ -76,7 +78,10 @@ class FilesTreeView(QTreeView):
                 menu.addSeparator()
 
             menu.addAction(self.win.actionPreview_File)
+            menu.addSeparator()
             menu.addAction(self.win.actionSplitClip)
+            menu.addAction(self.win.actionExportClips)
+            menu.addSeparator()
             menu.addAction(self.win.actionAdd_to_Timeline)
             menu.addAction(self.win.actionFile_Properties)
             menu.addSeparator()
@@ -113,8 +118,8 @@ class FilesTreeView(QTreeView):
         # Start drag operation
         drag = QDrag(self)
         drag.setMimeData(self.model().mimeData(selected))
-        drag.setPixmap(icon.pixmap(QSize(self.drag_item_size, self.drag_item_size)))
-        drag.setHotSpot(QPoint(self.drag_item_size / 2, self.drag_item_size / 2))
+        drag.setPixmap(icon.pixmap(self.drag_item_size))
+        drag.setHotSpot(self.drag_item_center)
         drag.exec_()
 
     # Without defining this method, the 'copy' action doesn't show with cursor
@@ -215,7 +220,7 @@ class FilesTreeView(QTreeView):
         self.setDropIndicatorShown(True)
 
         # Setup header columns and layout
-        self.setIconSize(QSize(75, 62))
+        self.setIconSize(info.TREE_ICON_SIZE)
         self.setIndentation(0)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet('QTreeView::item { padding-top: 2px; }')

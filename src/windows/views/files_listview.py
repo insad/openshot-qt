@@ -30,6 +30,7 @@ from PyQt5.QtCore import QSize, Qt, QPoint, QRegExp
 from PyQt5.QtGui import QDrag, QCursor
 from PyQt5.QtWidgets import QListView, QAbstractItemView, QMenu
 
+from classes import info
 from classes.app import get_app
 from classes.logger import log
 from classes.query import File
@@ -37,7 +38,8 @@ from classes.query import File
 
 class FilesListView(QListView):
     """ A ListView QWidget used on the main window """
-    drag_item_size = 48
+    drag_item_size = QSize(48, 48)
+    drag_item_center = QPoint(24, 24)
 
     def contextMenuEvent(self, event):
         event.accept()
@@ -73,7 +75,10 @@ class FilesListView(QListView):
                 menu.addSeparator()
 
             menu.addAction(self.win.actionPreview_File)
+            menu.addSeparator()
             menu.addAction(self.win.actionSplitClip)
+            menu.addAction(self.win.actionExportClips)
+            menu.addSeparator()
             menu.addAction(self.win.actionAdd_to_Timeline)
             menu.addAction(self.win.actionFile_Properties)
             menu.addSeparator()
@@ -112,8 +117,8 @@ class FilesListView(QListView):
         # Start drag operation
         drag = QDrag(self)
         drag.setMimeData(self.model().mimeData(selected))
-        drag.setPixmap(icon.pixmap(QSize(self.drag_item_size, self.drag_item_size)))
-        drag.setHotSpot(QPoint(self.drag_item_size / 2, self.drag_item_size / 2))
+        drag.setPixmap(icon.pixmap(self.drag_item_size))
+        drag.setHotSpot(self.drag_item_center)
         drag.exec_()
 
     # Without defining this method, the 'copy' action doesn't show with cursor
@@ -181,8 +186,8 @@ class FilesListView(QListView):
         self.setDropIndicatorShown(True)
 
         # Setup header columns and layout
-        self.setIconSize(QSize(131, 108))
-        self.setGridSize(QSize(102, 92))
+        self.setIconSize(info.LIST_ICON_SIZE)
+        self.setGridSize(info.LIST_GRID_SIZE)
         self.setViewMode(QListView.IconMode)
         self.setResizeMode(QListView.Adjust)
 

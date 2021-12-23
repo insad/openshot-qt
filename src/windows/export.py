@@ -50,7 +50,6 @@ from PyQt5.QtGui import QIcon
 from classes import info
 from classes import ui_util
 from classes import openshot_rc  # noqa
-from classes import settings
 from classes.logger import log
 from classes.app import get_app
 from classes.metrics import track_metric_screen, track_metric_error
@@ -78,12 +77,12 @@ class Export(QDialog):
 
         # get translations & settings
         _ = get_app()._tr
-        self.s = settings.get_settings()
+        self.s = get_app().get_settings()
 
         track_metric_screen("export-screen")
 
         # Dynamically load tabs from settings data
-        self.settings_data = settings.get_settings().get_all_settings()
+        self.settings_data = self.s.get_all_settings()
 
         # Add buttons to interface
         self.cancel_button = QPushButton(_('Cancel'))
@@ -94,14 +93,6 @@ class Export(QDialog):
         self.buttonBox.addButton(self.cancel_button, QDialogButtonBox.RejectRole)
         self.close_button.setVisible(False)
         self.exporting = False
-
-        # Update FPS / Profile timer
-        # Timer to use a delay before applying new profile/fps data (so we don't spam libopenshot)
-        self.delayed_fps_timer = None
-        self.delayed_fps_timer = QTimer()
-        self.delayed_fps_timer.setInterval(200)
-        self.delayed_fps_timer.setSingleShot(True)
-        self.delayed_fps_timer.timeout.connect(self.delayed_fps_callback)
 
         # Pause playback (to prevent crash since we are fixing to change the timeline's max size)
         get_app().window.actionPlay_trigger(None, force="pause")
@@ -280,19 +271,6 @@ class Export(QDialog):
         # Determine the length of the timeline (in frames)
         self.updateFrameRate()
 
-    def delayed_fps_callback(self):
-        """Callback for fps/profile changed event timer
-        (to delay the timeline mapping so we don't spam libopenshot)"""
-        # Calculate fps
-        fps_double = self.timeline.info.fps.ToDouble()
-
-        # Apply mapping if valid fps detected (anything larger than 300 fps is considered invalid)
-        if self.timeline and fps_double <= 300.0:
-            log.info("Valid framerate detected, sending to libopenshot: %s" % fps_double)
-            self.timeline.ApplyMapperToClips()
-        else:
-            log.warning("Invalid framerate detected, not sending it to libopenshot: %s" % fps_double)
-
     def getProfilePath(self, profile_name):
         """Get the profile path that matches the name"""
         for profile, path in self.profile_paths.items():
@@ -312,7 +290,7 @@ class Export(QDialog):
             percentage_string = format_of_progress_string % (( current_frame - start_frame ) / ( end_frame - start_frame ) * 100)
         else:
             percentage_string = "100%"
-        self.progressExportVideo.setValue(current_frame)
+        self.progressExportVideo.setValue(int(current_frame))
         self.progressExportVideo.setFormat(percentage_string)
         self.setWindowTitle("%s %s" % (percentage_string, title_message))
 
@@ -346,10 +324,6 @@ class Export(QDialog):
         self.timeline.info.sample_rate = self.txtSampleRate.value()
         self.timeline.info.channels = self.txtChannels.value()
         self.timeline.info.channel_layout = self.cboChannelLayout.currentData()
-
-        # Send changes to libopenshot (apply mappings to all framemappers)
-        # Start or restart timer to process changes after a small delay
-        self.delayed_fps_timer.start()
 
         # Determine max frame (based on clips)
         self.timeline_length_int = self.timeline.GetMaxFrame()
@@ -711,10 +685,14 @@ class Export(QDialog):
         # get translations
         _ = get_app()._tr
 
+        # Init some variables
+        seconds_run = 0
+        fps_encode = 0
+
         # Init progress bar
-        self.progressExportVideo.setMinimum(self.txtStartFrame.value())
-        self.progressExportVideo.setMaximum(self.txtEndFrame.value())
-        self.progressExportVideo.setValue(self.txtStartFrame.value())
+        self.progressExportVideo.setMinimum(int(self.txtStartFrame.value()))
+        self.progressExportVideo.setMaximum(int(self.txtEndFrame.value()))
+        self.progressExportVideo.setValue(int(self.txtStartFrame.value()))
 
         # Prompt error message
         if self.txtStartFrame.value() == self.txtEndFrame.value():
@@ -838,6 +816,15 @@ class Export(QDialog):
             # Re-update the timeline FPS again (since the timeline just got clobbered)
             self.updateFrameRate()
 
+        # Apply mappers to timeline readers
+        self.timeline.ApplyMapperToClips()
+
+        # Initialize
+        max_frame = 0
+
+        # Precision of the progress bar
+        format_of_progress_string = "%4.1f%% "
+
         # Create FFmpegWriter
         try:
             w = openshot.FFmpegWriter(export_file_path)
@@ -895,15 +882,11 @@ class Export(QDialog):
 
             progressstep = max(1 , round(( video_settings.get("end_frame") - video_settings.get("start_frame") ) / 1000))
             start_time_export = time.time()
-            seconds_run = 0
             start_frame_export = video_settings.get("start_frame")
             end_frame_export = video_settings.get("end_frame")
             last_exported_time = time.time()
             last_displayed_exported_portion = 0.0
-            current_exported_portion = 0.0
-            digits_after_decimalpoint = 1
-            # Precision of the progress bar
-            format_of_progress_string = "%4.1f%% "
+
             # Write each frame in the selected range
             for frame in range(video_settings.get("start_frame"), video_settings.get("end_frame") + 1):
                 # Update progress bar (emit signal to main window)
@@ -920,12 +903,12 @@ class Export(QDialog):
                         # We want at least 1 digit after the decimal point
                         digits_after_decimalpoint = 1
                     if digits_after_decimalpoint > 5:
-                        # We don't want not more than 5 difits after the decimal point
+                        # We don't want not more than 5 digits after the decimal point
                         digits_after_decimalpoint = 5
                     last_displayed_exported_portion = current_exported_portion
                     format_of_progress_string = "%4." + str(digits_after_decimalpoint) + "f%% "
                     last_exported_time = time.time()
-                    if ((( frame - start_frame_export ) != 0) & (( end_time_export - start_time_export ) != 0)):
+                    if ((frame - start_frame_export) != 0) & ((end_time_export - start_time_export) != 0):
                         seconds_left = round(( start_time_export - end_time_export )*( frame - end_frame_export )/( frame - start_frame_export ))
                         fps_encode = ((frame - start_frame_export)/(end_time_export-start_time_export))
                         if frame == end_frame_export:
@@ -945,6 +928,9 @@ class Export(QDialog):
                     # Process events (to show the progress bar moving)
                     QCoreApplication.processEvents()
 
+                # track largest frame processed
+                max_frame = frame
+
                 # Write the frame object to the video
                 w.WriteFrame(self.timeline.GetFrame(frame))
 
@@ -963,7 +949,7 @@ class Export(QDialog):
                 title_message,
                 video_settings.get("start_frame"),
                 video_settings.get("end_frame"),
-                frame,
+                max_frame,
                 format_of_progress_string
             )
 
@@ -1022,17 +1008,6 @@ class Export(QDialog):
 
             # Reveal done button
             self.close_button.setVisible(True)
-
-            # Restore windows title to show elapsed time
-            title_message = titlestring(seconds_run, fps_encode, "Elapsed")
-
-            self.ExportFrame.emit(
-                title_message,
-                video_settings.get("start_frame"),
-                video_settings.get("end_frame"),
-                frame,
-                format_of_progress_string
-            )
 
             # Make progress bar green (to indicate we are done)
             from PyQt5.QtGui import QPalette

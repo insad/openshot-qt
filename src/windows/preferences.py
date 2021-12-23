@@ -40,7 +40,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import QKeySequence, QIcon
 
-from classes import info, ui_util, settings
+from classes import info, ui_util
 from classes import openshot_rc  # noqa
 from classes.app import get_app
 from classes.language import get_all_languages
@@ -68,10 +68,10 @@ class Preferences(QDialog):
         ui_util.init_ui(self)
 
         # Get settings
-        self.s = settings.get_settings()
+        self.s = get_app().get_settings()
 
         # Dynamically load tabs from settings data
-        self.settings_data = settings.get_settings().get_all_settings()
+        self.settings_data = self.s.get_all_settings()
 
         # Track metrics
         track_metric_screen("preferences-screen")
@@ -102,7 +102,7 @@ class Preferences(QDialog):
 
     def txtSearch_changed(self):
         """textChanged event handler for search box"""
-        log.info("Search for %s" % self.txtSearch.text())
+        log.info("Search for %s", self.txtSearch.text())
 
         # Populate preferences
         self.Populate(filter=self.txtSearch.text())
@@ -224,7 +224,7 @@ class Preferences(QDialog):
                     widget.setMinimum(int(param["min"]))
                     widget.setMaximum(int(param["max"]))
                     widget.setValue(int(param["value"]))
-                    widget.setSingleStep(1.0)
+                    widget.setSingleStep(1)
                     widget.setToolTip(param["title"])
                     widget.valueChanged.connect(functools.partial(self.spinner_value_changed, param))
 
@@ -278,9 +278,8 @@ class Preferences(QDialog):
                         value_list.append({"name": "Default", "value": ""})
                         for audio_device in get_app().window.preview_thread.player.GetAudioDeviceNames():
                             value_list.append({
-                                "name": "%s: %s" % (
-                                    audio_device.type, audio_device.name),
-                                "value": audio_device.name,
+                                "name": "%s: %s" % (audio_device[1], audio_device[0]),
+                                "value": audio_device[0],
                                 })
 
                     # Overwrite value list (for language dropdown)
@@ -317,7 +316,7 @@ class Preferences(QDialog):
                                 value_list.remove(value_item)
 
                         # Remove hardware mode items which cannot decode the example video
-                        log.debug("Preparing to test hardware decoding: %s" % (value_list))
+                        log.debug("Preparing to test hardware decoding: %s", value_list)
                         for value_item in list(value_list):
                             v = value_item["value"]
                             if (not self.testHardwareDecode(value_list, v, 0)
@@ -470,7 +469,7 @@ class Preferences(QDialog):
         # Trigger specific actions
         if param["setting"] == "debug-mode":
             # Update debug setting of timeline
-            log.info("Setting debug-mode to %s" % (state == Qt.Checked))
+            log.info("Setting debug-mode to %s", state == Qt.Checked)
             debug_enabled = (state == Qt.Checked)
 
             # Enable / Disable logger
@@ -528,7 +527,9 @@ class Preferences(QDialog):
         if param.get("category") == "Keyboard":
             previous_value = value
             value = QKeySequence(value).toString()
-            log.info("Parsing keyboard mapping via QKeySequence from %s to %s" % (previous_value, value))
+            log.info(
+                "Parsing keyboard mapping via QKeySequence from %s to %s",
+                previous_value, value)
 
         # Save setting
         self.s.set(param["setting"], value)
@@ -604,11 +605,13 @@ class Preferences(QDialog):
             if reader.GetFrame(0).CheckPixel(0, 0, 2, 133, 255, 255, 5):
                 is_supported = True
                 self.hardware_tests_cards[decoder_card].append(int(decoder))
-                log.debug("Successful hardware decoder! %s (%s-%s)" % (decoder_name, decoder, decoder_card))
+                log.debug(
+                    "Successful hardware decoder! %s (%s-%s)",
+                    decoder_name, decoder, decoder_card)
             else:
                 log.debug(
                     "CheckPixel failed testing hardware decoding (i.e. wrong color found): %s (%s-%s)",
-                    (decoder_name, decoder, decoder_card))
+                    decoder_name, decoder, decoder_card)
 
             reader.Close()
             clip.Close()
@@ -616,7 +619,7 @@ class Preferences(QDialog):
         except Exception:
             log.debug(
                 "Exception trying to test hardware decoding (this is expected): %s (%s-%s)",
-                (decoder_name, decoder, decoder_card))
+                decoder_name, decoder, decoder_card)
 
         # Resume current settings
         openshot.Settings.Instance().HARDWARE_DECODER = current_decoder

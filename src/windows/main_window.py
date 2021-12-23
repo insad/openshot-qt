@@ -29,7 +29,6 @@
 
 import os
 import shutil
-import sys
 import webbrowser
 from copy import deepcopy
 from time import sleep
@@ -46,19 +45,18 @@ from PyQt5.QtWidgets import (
     QMessageBox, QDialog, QFileDialog, QInputDialog,
     QAction, QActionGroup, QSizePolicy,
     QStatusBar, QToolBar, QToolButton,
-    QLineEdit, QSlider, QLabel, QComboBox, QTextEdit
+    QLineEdit, QComboBox, QTextEdit
 )
 
-from classes import exceptions, info, settings, qt_types, ui_util, updates
+from classes import exceptions, info, qt_types, sentry, ui_util, updates
 from classes.app import get_app
-from classes.conversion import zoomToSeconds, secondsToZoom
 from classes.exporters.edl import export_edl
 from classes.exporters.final_cut_pro import export_xml
 from classes.importers.edl import import_edl
 from classes.importers.final_cut_pro import import_xml
 from classes.logger import log
 from classes.metrics import track_metric_session, track_metric_screen
-from classes.query import Clip, Transition, Marker, Track
+from classes.query import Clip, Transition, Marker, Track, Effect
 from classes.thumbnail import httpThumbnailServerThread
 from classes.time_parts import secondsToTimecode
 from classes.timeline import TimelineSync
@@ -91,6 +89,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
     refreshFrameSignal = pyqtSignal()
     refreshFilesSignal = pyqtSignal()
     refreshTransitionsSignal = pyqtSignal()
+    refreshEffectsSignal = pyqtSignal()
     LoadFileSignal = pyqtSignal(str)
     PlaySignal = pyqtSignal(int)
     PauseSignal = pyqtSignal()
@@ -101,6 +100,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
     FoundVersionSignal = pyqtSignal(str)
     WaveformReady = pyqtSignal(str, list)
     TransformSignal = pyqtSignal(str)
+    KeyFrameTransformSignal = pyqtSignal(str, str)
     SelectRegionSignal = pyqtSignal(str)
     MaxSizeChanged = pyqtSignal(object)
     InsertKeyframe = pyqtSignal(object)
@@ -109,6 +109,14 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
     FileUpdated = pyqtSignal(str)
     CaptionTextUpdated = pyqtSignal(str, object)
     CaptionTextLoaded = pyqtSignal(str, object)
+    TimelineZoom = pyqtSignal(float)     # Signal to zoom into timeline from zoom slider
+    TimelineScrolled = pyqtSignal(list)  # Scrollbar changed signal from timeline
+    TimelineScroll = pyqtSignal(float)   # Signal to force scroll timeline to specific point
+    TimelineCenter = pyqtSignal()        # Signal to force center scroll on playhead
+    SelectionAdded = pyqtSignal(str, str, bool)  # Signal to add a selection
+    SelectionRemoved = pyqtSignal(str, str)      # Signal to remove a selection
+    SelectionChanged = pyqtSignal()      # Signal after selections have been changed (added/removed)
+    SetKeyframeFilter = pyqtSignal(str)     # Signal to only show keyframes for the selected property
 
     # Docks are closable, movable and floatable
     docks_frozen = False
@@ -122,7 +130,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         self.tutorial_manager.hide_dialog()
 
         # Prompt user to save (if needed)
-        if app.project.needs_save() and self.mode != "unittest":
+        if app.project.needs_save():
             log.info('Prompt user to save project')
             # Translate object
             _ = app._tr
@@ -159,6 +167,12 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         # Stop threads
         self.StopSignal.emit()
 
+        # Stop thumbnail server thread
+        self.http_server_thread.kill()
+
+        # Stop ZMQ polling thread
+        get_app().logger_libopenshot.kill()
+
         # Process any queued events
         QCoreApplication.processEvents()
 
@@ -169,8 +183,9 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         self.preview_parent.background.wait(5000)
 
         # Close Timeline
-        self.timeline_sync.timeline.Close()
-        self.timeline_sync.timeline = None
+        if self.timeline_sync and self.timeline_sync.timeline:
+            self.timeline_sync.timeline.Close()
+            self.timeline_sync.timeline = None
 
         # Destroy lock file
         self.destroy_lock_file()
@@ -213,12 +228,16 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         lock_path = os.path.join(info.USER_PATH, ".lock")
         # Check if it already exists
         if os.path.exists(lock_path):
-            exceptions.libopenshot_crash_recovery()
-            log.error("Unhandled crash detected. Preserving cache.")
+            last_log_line = exceptions.libopenshot_crash_recovery() or "No Log Detected"
+            log.error(f"Unhandled crash detected: {last_log_line}")
             self.destroy_lock_file()
         else:
             # Normal startup, clear thumbnails
-            self.clear_all_thumbnails()
+            self.clear_temporary_files()
+
+        # Reset Sentry component (it can be temporarily changed to libopenshot during
+        # the call to libopenshot_crash_recovery above)
+        sentry.set_tag("component", "openshot-qt")
 
         # Write lock file (try a few times if failure)
         lock_value = str(uuid4())
@@ -269,7 +288,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
                 return
 
         # Clear any previous thumbnails
-        self.clear_all_thumbnails()
+        self.clear_temporary_files()
 
         # clear data and start new project
         app.project.load("")
@@ -288,6 +307,9 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
         # Seek to frame 0
         self.SeekSignal.emit(1)
+
+        # Update max size (for fast previews)
+        self.MaxSizeChanged.emit(self.videoPreview.size())
 
     def actionAnimatedTitle_trigger(self):
         # show dialog
@@ -383,7 +405,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
         try:
             # Update history in project data
-            s = settings.get_settings()
+            s = app.get_settings()
             app.updates.save_history(app.project, s.get("history-limit"))
 
             # Save project to file
@@ -395,10 +417,10 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
             # Load recent projects again
             self.load_recent_menu()
 
-            log.info("Saved project {}".format(file_path))
+            log.info("Saved project %s", file_path)
 
         except Exception as ex:
-            log.error("Couldn't save project %s.", file_path, exc_info=1)
+            log.error("Couldn't save project %s", file_path, exc_info=1)
             QMessageBox.warning(self, _("Error Saving Project"), str(ex))
 
     def open_project(self, file_path, clear_thumbnails=True):
@@ -439,7 +461,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
             if os.path.exists(file_path):
                 # Clear any previous thumbnails
                 if clear_thumbnails:
-                    self.clear_all_thumbnails()
+                    self.clear_temporary_files()
 
                 # Load project file
                 app.project.load(file_path, clear_thumbnails)
@@ -459,6 +481,9 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
                 # Refresh thumbnail
                 self.refreshFrameSignal.emit()
+
+                # Update max size (for fast previews)
+                self.MaxSizeChanged.emit(self.videoPreview.size())
 
                 # Load recent projects again
                 self.load_recent_menu()
@@ -480,37 +505,31 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         # Restore normal cursor
         app.restoreOverrideCursor()
 
-    def clear_all_thumbnails(self):
+    def clear_temporary_files(self):
         """Clear all user thumbnails"""
-        try:
-            clear_path = os.path.join(info.USER_PATH, "thumbnail")
-            if os.path.exists(clear_path):
-                log.info("Clear all thumbnails: %s", clear_path)
-                shutil.rmtree(clear_path)
-                os.mkdir(clear_path)
-
-            # Clear any blender animations
-            clear_path = os.path.join(info.USER_PATH, "blender")
-            if os.path.exists(clear_path):
-                log.info("Clear all animations: %s", clear_path)
-                shutil.rmtree(clear_path)
-                os.mkdir(clear_path)
-
-            # Clear any title animations
-            clear_path = os.path.join(info.USER_PATH, "title")
-            if os.path.exists(clear_path):
-                log.info("Clear all titles: %s", clear_path)
-                shutil.rmtree(clear_path)
-                os.mkdir(clear_path)
+        for temp_dir in [
+                info.get_default_path("THUMBNAIL_PATH"),
+                info.get_default_path("BLENDER_PATH"),
+                info.get_default_path("TITLE_PATH"),
+                ]:
+            try:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                    log.info("Cleared temporary files: %s", temp_dir)
+                os.mkdir(temp_dir)
+            except Exception:
+                log.warning("Failed to clear %s", temp_dir, exc_info=1)
 
             # Clear any backups
             if os.path.exists(info.BACKUP_FILE):
-                log.info("Clear backup: %s", info.BACKUP_FILE)
-                # Remove backup file
-                os.unlink(info.BACKUP_FILE)
+                try:
+                    # Remove backup file
+                    os.unlink(info.BACKUP_FILE)
+                    log.info("Cleared backup: %s", info.BACKUP_FILE)
+                except Exception:
+                    log.warning("Could not delete backup file %s",
+                                info.BACKUP_FILE, exc_info=1)
 
-        except Exception:
-            log.info("Failed to clear %s", clear_path, exc_info=1)
 
     def actionOpen_trigger(self):
         app = get_app()
@@ -570,56 +589,57 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         import time
 
         app = get_app()
-        s = settings.get_settings()
+        s = app.get_settings()
 
         # Get current filepath (if any)
         file_path = app.project.current_filepath
-        if app.project.needs_save():
-            log.info("auto_save_project")
+        if not app.project.needs_save():
+            return
 
-            if file_path:
-                # A Real project file exists
-                # Append .osp if needed
-                if ".osp" not in file_path:
+        if file_path:
+            # A Real project file exists
+            # Append .osp if needed
+            if ".osp" not in file_path:
                     file_path = "%s.osp" % file_path
-                folder_path, file_name = os.path.split(file_path)
-                file_name, file_ext = os.path.splitext(file_name)
+            folder_path, file_name = os.path.split(file_path)
+            file_name, file_ext = os.path.splitext(file_name)
 
-                # Make copy of unsaved project file in 'recovery' folder
-                recover_path_with_timestamp = os.path.join(
-                    info.RECOVERY_PATH, "%d-%s.osp" % (int(time.time()), file_name))
+            # Make copy of unsaved project file in 'recovery' folder
+            recover_path_with_timestamp = os.path.join(
+                info.RECOVERY_PATH, "%d-%s.osp" % (int(time.time()), file_name))
+            if os.path.exists(file_path):
                 shutil.copy(file_path, recover_path_with_timestamp)
-
-                # Find any recovery file older than X auto-saves
-                old_backup_files = []
-                backup_file_count = 0
-                for backup_filename in reversed(sorted(os.listdir(info.RECOVERY_PATH))):
-                    if ".osp" in backup_filename:
-                        backup_file_count += 1
-                        if backup_file_count > s.get("recovery-limit"):
-                            old_backup_files.append(os.path.join(info.RECOVERY_PATH, backup_filename))
-
-                # Delete recovery files which are 'too old'
-                for backup_filepath in old_backup_files:
-                    os.unlink(backup_filepath)
-
-                # Save project
-                log.info("Auto save project file: %s", file_path)
-                self.save_project(file_path)
-
-                # Remove backup.osp (if any)
-                if os.path.exists(info.BACKUP_FILE):
-                    # Delete backup.osp since we just saved the actual project
-                    os.unlink(info.BACKUP_FILE)
-
             else:
-                # No saved project found
-                log.info("Creating backup of project file: %s", info.BACKUP_FILE)
-                app.project.save(info.BACKUP_FILE, move_temp_files=False, make_paths_relative=False)
+                log.warning(
+                    "Existing project *.osp file not found during recovery process: %s",
+                    file_path)
 
-                # Clear the file_path (which is set by saving the project)
-                app.project.current_filepath = None
-                app.project.has_unsaved_changes = True
+            # Find any recovery file older than X auto-saves
+            old_backup_files = []
+            backup_file_count = 0
+            for backup_filename in reversed(sorted(os.listdir(info.RECOVERY_PATH))):
+                if ".osp" in backup_filename:
+                    backup_file_count += 1
+                    if backup_file_count > s.get("recovery-limit"):
+                        old_backup_files.append(os.path.join(info.RECOVERY_PATH, backup_filename))
+
+            # Delete recovery files which are 'too old'
+            for backup_filepath in old_backup_files:
+                os.unlink(backup_filepath)
+
+            # Save project
+            log.info("Auto save project file: %s", file_path)
+            self.save_project(file_path)
+
+            # Remove backup.osp (if any)
+            if os.path.exists(info.BACKUP_FILE):
+                # Delete backup.osp since we just saved the actual project
+                os.unlink(info.BACKUP_FILE)
+
+        else:
+            # No saved project found
+            log.info("Creating backup of project file: %s", info.BACKUP_FILE)
+            app.project.save(info.BACKUP_FILE, backup_only=True)
 
     def actionSaveAs_trigger(self):
         app = get_app()
@@ -799,7 +819,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
             log.info('Preferences add cancelled')
 
         # Save settings
-        s = settings.get_settings()
+        s = get_app().get_settings()
         s.save()
 
         # Restore normal cursor
@@ -822,6 +842,15 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
     def actionTransitionsShowCommon_trigger(self, checked=True):
         self.refreshTransitionsSignal.emit()
+
+    def actionEffectsShowAll_trigger(self, checked=True):
+        self.refreshEffectsSignal.emit()
+
+    def actionEffectsShowVideo_trigger(self, checked=True):
+        self.refreshEffectsSignal.emit()
+
+    def actionEffectsShowAudio_trigger(self, checked=True):
+        self.refreshEffectsSignal.emit()
 
     def actionHelpContents_trigger(self, checked=True):
         try:
@@ -977,7 +1006,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         self.setStatusBar(self.statusBar)
 
         # Determine path for saved frame - Default export path
-        recommended_path = recommended_path = os.path.join(info.HOME_PATH)
+        recommended_path = os.path.join(info.HOME_PATH)
         if app.project.current_filepath:
             recommended_path = os.path.dirname(app.project.current_filepath)
 
@@ -1007,7 +1036,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
         # Save current cache object and create a new CacheMemory object (ignore quality and scale prefs)
         old_cache_object = self.cache_object
-        new_cache_object = openshot.CacheMemory(settings.get_settings().get("cache-limit-mb") * 1024 * 1024)
+        new_cache_object = openshot.CacheMemory(app.get_settings().get("cache-limit-mb") * 1024 * 1024)
         self.timeline_sync.timeline.SetCache(new_cache_object)
 
         # Set MaxSize to full project resolution and clear preview cache so we get a full resolution frame
@@ -1232,9 +1261,6 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         # Temporarily for debugging
         log.info("Tracks after: {}".format([{x['number']: x['id']} for x in reversed(tracks)]))
 
-    def actionArrowTool_trigger(self, checked=True):
-        log.info("actionArrowTool_trigger")
-
     def actionSnappingTool_trigger(self, checked=True):
         log.info("actionSnappingTool_trigger")
 
@@ -1263,7 +1289,11 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
         # Look for existing Marker
         marker = Marker()
-        marker.data = {"position": position, "icon": "blue.png"}
+        marker.data = {
+            "position": position,
+            "icon": "blue.png",
+            "vector": "blue",
+            }
         marker.save()
 
     def findAllMarkerPositions(self):
@@ -1287,7 +1317,16 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
             # add all keyframes
             for property in obj.data:
                 try:
+                    # Try looping through keyframe points
                     for point in obj.data[property]["Points"]:
+                        keyframe_time = (point["co"]["X"]-1)/fps_float - obj.data["start"] + obj.data["position"]
+                        if clip_start_time < keyframe_time < clip_stop_time:
+                            positions.append(keyframe_time)
+                except (TypeError, KeyError):
+                    pass
+                try:
+                    # Try looping through color keyframe points
+                    for point in obj.data[property]["red"]["Points"]:
                         keyframe_time = (point["co"]["X"]-1)/fps_float - obj.data["start"] + obj.data["position"]
                         if clip_start_time < keyframe_time < clip_stop_time:
                             positions.append(keyframe_time)
@@ -1299,7 +1338,16 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
                 for effect_data in obj.data["effects"]:
                     for prop in effect_data:
                         try:
+                            # Try looping through keyframe points
                             for point in effect_data[prop]["Points"]:
+                                keyframe_time = (point["co"]["X"]-1)/fps_float + clip_orig_time
+                                if clip_start_time < keyframe_time < clip_stop_time:
+                                    positions.append(keyframe_time)
+                        except (TypeError, KeyError):
+                            pass
+                        try:
+                            # Try looping through color keyframe points
+                            for point in effect_data[prop]["red"]["Points"]:
                                 keyframe_time = (point["co"]["X"]-1)/fps_float + clip_orig_time
                                 if clip_start_time < keyframe_time < clip_stop_time:
                                     positions.append(keyframe_time)
@@ -1409,14 +1457,14 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
     def getShortcutByName(self, setting_name):
         """ Get a key sequence back from the setting name """
-        s = settings.get_settings()
+        s = get_app().get_settings()
         shortcut = QKeySequence(s.get(setting_name))
         return shortcut
 
     def getAllKeyboardShortcuts(self):
         """ Get a key sequence back from the setting name """
         keyboard_shortcuts = []
-        all_settings = settings.get_settings()._data
+        all_settings = get_app().get_settings()._data
         for setting in all_settings:
             if setting.get('category') == 'Keyboard':
                 keyboard_shortcuts.append(setting)
@@ -1869,10 +1917,10 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
                 m.delete()
 
     def actionTimelineZoomIn_trigger(self):
-        self.sliderZoom.setValue(self.sliderZoom.value() - self.sliderZoom.singleStep())
+        self.sliderZoomWidget.zoomIn()
 
     def actionTimelineZoomOut_trigger(self):
-        self.sliderZoom.setValue(self.sliderZoom.value() + self.sliderZoom.singleStep())
+        self.sliderZoomWidget.zoomOut()
 
     def actionFullscreen_trigger(self):
         # Toggle fullscreen state (current state mask XOR WindowFullScreen)
@@ -1905,12 +1953,21 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         else:
             log.info('File Properties Cancelled')
 
+    def actionExportClips_trigger(self):
+        from windows.export_clips import clipExportWindow
+        f = self.selected_files()
+        exp = clipExportWindow(export_clips_arg=f)
+        try:
+            exp.exec_()
+        except:
+            log.info("Error in export clips dialog")
+
     def actionDetailsView_trigger(self):
         log.info("Switch to Details View")
 
         # Get settings
         app = get_app()
-        s = settings.get_settings()
+        s = app.get_settings()
 
         # Files
         if app.context_menu_object == "files":
@@ -1938,7 +1995,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
         # Get settings
         app = get_app()
-        s = settings.get_settings()
+        s = app.get_settings()
 
         # Files
         if app.context_menu_object == "files":
@@ -2058,19 +2115,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
         # Set initial size of docks
         simple_state = "".join([
-            "AAAA/wAAAAD9AAAAAwAAAAAAAAEnAAAC3/wCAAAAA/wAAAJeAAAApwAAAAAA////+gAAAAACAAAAAfsAAAA"
-            "YAGQAbwBjAGsASwBlAHkAZgByAGEAbQBlAAAAAAD/////AAAAAAAAAAD7AAAAHABkAG8AYwBrAFAAcgBvAH"
-            "AAZQByAHQAaQBlAHMAAAAAJwAAAt8AAAChAP////sAAAAYAGQAbwBjAGsAVAB1AHQAbwByAGkAYQBsAgAAA"
-            "AAAAAAAAAAAyAAAAGQAAAABAAABHAAAAUD8AgAAAAH7AAAAGABkAG8AYwBrAEsAZQB5AGYAcgBhAG0AZQEA"
-            "AAFYAAAAFQAAAAAAAAAAAAAAAgAABEYAAALY/AEAAAAC/AAAAAAAAANnAAAA+gD////8AgAAAAL8AAAAJwA"
-            "AAcAAAACvAP////wBAAAAAvwAAAAAAAABFQAAAHsA////+gAAAAACAAAAA/sAAAASAGQAbwBjAGsARgBpAG"
-            "wAZQBzAQAAAAD/////AAAAkgD////7AAAAHgBkAG8AYwBrAFQAcgBhAG4AcwBpAHQAaQBvAG4AcwEAAAAA/"
-            "////wAAAJIA////+wAAABYAZABvAGMAawBFAGYAZgBlAGMAdABzAQAAAAD/////AAAAkgD////7AAAAEgBk"
-            "AG8AYwBrAFYAaQBkAGUAbwEAAAEbAAACTAAAAEcA////+wAAABgAZABvAGMAawBUAGkAbQBlAGwAaQBuAGU"
-            "BAAAB7QAAARIAAACWAP////wAAANtAAAA2QAAAIIA////+gAAAAECAAAAAvsAAAAiAGQAbwBjAGsAQwBhAH"
-            "AAdABpAG8AbgBFAGQAaQB0AG8AcgAAAAAA/////wAAAJgA////+wAAABQAZABvAGMAawBFAG0AbwBqAGkAc"
-            "wEAAADFAAACOgAAAJIA////AAAERgAAAAEAAAABAAAAAgAAAAEAAAAC/AAAAAEAAAACAAAAAQAAAA4AdABv"
-            "AG8AbABCAGEAcgEAAAAA/////wAAAAAAAAAA"
+            "AAAA/wAAAAD9AAAAAwAAAAAAAAEnAAAC3/wCAAAAA/wAAAJeAAAApwAAAAAA////+gAAAAACAAAAAfsAAAAYAGQAbwBjAGsASwBlAHkAZgByAGEAbQBlAAAAAAD/////AAAAAAAAAAD7AAAAHABkAG8AYwBrAFAAcgBvAHAAZQByAHQAaQBlAHMAAAAAJwAAAt8AAAChAP////sAAAAYAGQAbwBjAGsAVAB1AHQAbwByAGkAYQBsAgAABUQAAAF6AAABYAAAANwAAAABAAABHAAAAUD8AgAAAAH7AAAAGABkAG8AYwBrAEsAZQB5AGYAcgBhAG0AZQEAAAFYAAAAFQAAAAAAAAAAAAAAAgAABEYAAALC/AEAAAAC/AAAAAAAAARGAAAA+gD////8AgAAAAL8AAAAPQAAAa4AAACvAP////wBAAAAAvwAAAAAAAABwQAAAJcA////+gAAAAACAAAABPsAAAASAGQAbwBjAGsARgBpAGwAZQBzAQAAAAD/////AAAAkgD////7AAAAHgBkAG8AYwBrAFQAcgBhAG4AcwBpAHQAaQBvAG4AcwEAAAAA/////wAAAJIA////+wAAABYAZABvAGMAawBFAGYAZgBlAGMAdABzAQAAAAD/////AAAAkgD////7AAAAFABkAG8AYwBrAEUAbQBvAGoAaQBzAQAAAAD/////AAAAkgD////7AAAAEgBkAG8AYwBrAFYAaQBkAGUAbwEAAAHHAAACfwAAAEcA////+wAAABgAZABvAGMAawBUAGkAbQBlAGwAaQBuAGUBAAAB8QAAAQ4AAACWAP////sAAAAiAGQAbwBjAGsAQwBhAHAAdABpAG8AbgBFAGQAaQB0AG8AcgAAAANtAAAA2QAAAFgA////AAAERgAAAAEAAAABAAAAAgAAAAEAAAAC/AAAAAEAAAACAAAAAQAAAA4AdABvAG8AbABCAGEAcgEAAAAA/////wAAAAAAAAAA"
         ])
         self.restoreState(qt_types.str_to_bytes(simple_state))
         QCoreApplication.processEvents()
@@ -2137,7 +2182,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
     def actionTutorial_trigger(self):
         """ Show tutorial again """
-        s = settings.get_settings()
+        s = get_app().get_settings()
 
         # Clear tutorial settings
         s.set("tutorial_enabled", True)
@@ -2256,7 +2301,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
             log.info('addSelection: item_id: {}, item_type: {}, clear_existing: {}'.format(
                 item_id, item_type, clear_existing))
 
-        s = settings.get_settings()
+        s = get_app().get_settings()
 
         # Clear existing selection (if needed)
         if clear_existing:
@@ -2282,10 +2327,21 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
             elif item_type == "effect" and item_id not in self.selected_effects:
                 self.selected_effects.append(item_id)
 
+                effect = Effect.get(id=item_id)
+                if effect:
+                    if effect.data.get("has_tracked_object"):
+                        # Show bounding boxes transform on preview
+                        clip_id = effect.parent['id']
+                        self.KeyFrameTransformSignal.emit(item_id, clip_id)
+
+
             # Change selected item in properties view
             self.show_property_id = item_id
             self.show_property_type = item_type
             self.show_property_timer.start()
+
+        # Notify UI that selection has been potentially changed
+        self.selection_timer.start()
 
     # Remove from the selected items
     def removeSelection(self, item_id, item_type):
@@ -2318,8 +2374,14 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
             self.show_property_id = self.selected_effects[0]
             self.show_property_type = item_type
 
-        # Change selected item in properties view
+        # Change selected item
         self.show_property_timer.start()
+        self.selection_timer.start()
+
+    def emit_selection_signal(self):
+        """Emit a signal for selection changed. Callback for selection timer."""
+        # Notify UI that selection has been potentially changed
+        self.SelectionChanged.emit()
 
     def selected_files(self):
         """ Return a list of File objects for the Project Files dock's selection """
@@ -2339,7 +2401,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
     # Update window settings in setting store
     def save_settings(self):
-        s = settings.get_settings()
+        s = get_app().get_settings()
 
         # Save window state and geometry (saves toolbar and dock locations)
         s.set('window_state_v2', qt_types.bytes_to_str(self.saveState()))
@@ -2348,13 +2410,13 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
     # Get window settings from setting store
     def load_settings(self):
-        s = settings.get_settings()
+        s = get_app().get_settings()
 
         # Window state and geometry (also toolbar, dock locations and frozen UI state)
-        if s.get('window_state_v2'):
-            self.restoreState(qt_types.str_to_bytes(s.get('window_state_v2')))
         if s.get('window_geometry_v2'):
-            self.restoreGeometry(qt_types.str_to_bytes(s.get('window_geometry_v2')))
+            self.saved_geometry = qt_types.str_to_bytes(s.get('window_geometry_v2'))
+        if s.get('window_state_v2'):
+            self.saved_state = qt_types.str_to_bytes(s.get('window_state_v2'))
         if s.get('docks_frozen'):
             # Freeze all dockable widgets on the main screen
             self.freezeDocks()
@@ -2371,7 +2433,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
     def load_recent_menu(self):
         """ Clear and load the list of recent menu items """
-        s = settings.get_settings()
+        s = get_app().get_settings()
         _ = get_app()._tr  # Get translation function
 
         # Get list of recent projects
@@ -2407,7 +2469,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
     def remove_recent_project(self, file_path):
         """Remove a project from the Recent menu if OpenShot can't find it"""
-        s = settings.get_settings()
+        s = get_app().get_settings()
         recent_projects = s.get("recent_projects")
         if file_path in recent_projects:
             recent_projects.remove(file_path)
@@ -2420,7 +2482,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
     def clear_recents_clicked(self):
         """Clear all recent projects"""
-        s = settings.get_settings()
+        s = get_app().get_settings()
         s.set("recent_projects", [])
 
         # Reload recent project list
@@ -2472,6 +2534,15 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         # Add effects toolbar
         self.effectsToolbar = QToolBar("Effects Toolbar")
         self.effectsFilter = QLineEdit()
+        self.effectsActionGroup = QActionGroup(self)
+        self.effectsActionGroup.setExclusive(True)
+        self.effectsActionGroup.addAction(self.actionEffectsShowAll)
+        self.effectsActionGroup.addAction(self.actionEffectsShowVideo)
+        self.effectsActionGroup.addAction(self.actionEffectsShowAudio)
+        self.actionEffectsShowAll.setChecked(True)
+        self.effectsToolbar.addAction(self.actionEffectsShowAll)
+        self.effectsToolbar.addAction(self.actionEffectsShowVideo)
+        self.effectsToolbar.addAction(self.actionEffectsShowAudio)
         self.effectsFilter.setObjectName("effectsFilter")
         self.effectsFilter.setPlaceholderText(_("Filter"))
         self.effectsFilter.setClearButtonEnabled(True)
@@ -2550,7 +2621,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
         # Hook up caption editor signal
         self.captionTextEdit.textChanged.connect(self.captionTextEdit_TextChanged)
-        self.caption_save_timer = QTimer()
+        self.caption_save_timer = QTimer(self)
         self.caption_save_timer.setInterval(100)
         self.caption_save_timer.setSingleShot(True)
         self.caption_save_timer.timeout.connect(self.caption_editor_save)
@@ -2558,27 +2629,16 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         self.caption_model_row = None
 
         # Get project's initial zoom value
-        initial_scale = get_app().project.get("scale") or 15
-        # Round non-exponential scale down to next lowest power of 2
-        initial_zoom = secondsToZoom(initial_scale)
+        initial_scale = get_app().project.get("scale") or 15.0
 
-        # Setup Zoom slider
-        self.sliderZoom = QSlider(Qt.Horizontal, self)
-        self.sliderZoom.setPageStep(1)
-        self.sliderZoom.setRange(0, 30)
-        self.sliderZoom.setValue(initial_zoom)
-        self.sliderZoom.setInvertedControls(True)
-        self.sliderZoom.resize(100, 16)
-
-        self.zoomScaleLabel = QLabel(
-            _("{} seconds").format(zoomToSeconds(self.sliderZoom.value()))
-        )
+        # Setup Zoom Slider widget
+        from windows.views.zoom_slider import ZoomSlider
+        self.sliderZoomWidget = ZoomSlider(self)
+        self.sliderZoomWidget.setMinimumSize(200, 20)
+        self.sliderZoomWidget.setZoomFactor(initial_scale)
 
         # add zoom widgets
-        self.timelineToolbar.addAction(self.actionTimelineZoomIn)
-        self.timelineToolbar.addWidget(self.sliderZoom)
-        self.timelineToolbar.addAction(self.actionTimelineZoomOut)
-        self.timelineToolbar.addWidget(self.zoomScaleLabel)
+        self.timelineToolbar.addWidget(self.sliderZoomWidget)
 
         # Add timeline toolbar to web frame
         self.frameWeb.addWidget(self.timelineToolbar)
@@ -2597,7 +2657,6 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
     def foundCurrentVersion(self, version):
         """Handle the callback for detecting the current version on openshot.org"""
-        log.info('foundCurrentVersion: Found the latest version: %s' % version)
         _ = get_app()._tr
 
         # Compare versions (alphabetical compare of version strings should work fine)
@@ -2617,6 +2676,10 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
             updateButton.setDefaultAction(self.actionUpdate)
             updateButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
             self.toolBar.addWidget(updateButton)
+
+        # Initialize sentry exception tracing (now that we know the current version)
+        from classes import sentry
+        sentry.init_tracing()
 
     def moveEvent(self, event):
         """ Move tutorial dialogs also (if any)"""
@@ -2667,7 +2730,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
     def InitCacheSettings(self):
         """Set the correct cache settings for the timeline"""
         # Load user settings
-        s = settings.get_settings()
+        s = get_app().get_settings()
         log.info("InitCacheSettings")
         log.info("cache-mode: %s" % s.get("cache-mode"))
         log.info("cache-limit-mb: %s" % s.get("cache-limit-mb"))
@@ -2707,7 +2770,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
     def initModels(self):
         """Set up model/view classes for MainWindow"""
-        s = settings.get_settings()
+        s = get_app().get_settings()
 
         # Setup files tree and list view (both share a model)
         self.files_model = FilesModel()
@@ -2766,11 +2829,10 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         self.emojiListView = EmojisListView(self.emojis_model)
         self.tabEmojis.layout().addWidget(self.emojiListView)
 
-    def __init__(self, *args, mode=None):
+    def __init__(self, *args):
 
         # Create main window base class
         super().__init__(*args)
-        self.mode = mode    # None or unittest (None is normal usage)
         self.initialized = False
 
         # set window on app for reference during initialization of children
@@ -2779,7 +2841,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         _ = app._tr
 
         # Load user settings for window
-        s = settings.get_settings()
+        s = app.get_settings()
         self.recent_menu = None
 
         # Track metrics
@@ -2787,13 +2849,24 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
 
         # Set unique install id (if blank)
         if not s.get("unique_install_id"):
+            # This is assumed to be the 1st launch
             s.set("unique_install_id", str(uuid4()))
 
             # Track 1st launch metric
             track_metric_screen("initial-launch-screen")
 
-        # Track main screen
-        track_metric_screen("main-screen")
+            # Track 1st main screen
+            track_metric_screen("main-screen")
+
+            # Opt-out of metrics tracking on 1st launch (and prompt user)
+            track_metric_screen("metrics-opt-out")
+            s.set("send_metrics", False)
+        else:
+            # Only track main screen
+            track_metric_screen("main-screen")
+
+        # Set unique id for Sentry
+        sentry.set_user({"id": s.get("unique_install_id")})
 
         # Create blank tutorial manager
         self.tutorial_manager = None
@@ -2818,8 +2891,7 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         get_current_Version()
 
         # Connect signals
-        if self.mode != "unittest":
-            self.RecoverBackup.connect(self.recover_backup)
+        self.RecoverBackup.connect(self.recover_backup)
 
         # Initialize and start the thumbnail HTTP server
         self.http_server_thread = httpThumbnailServerThread()
@@ -2862,20 +2934,32 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         self.clearSelections()
 
         # Show Property timer
-        # Timer to use a delay before showing properties (to prevent a mass selection from trying
+        # Timer to use a delay before showing properties
+        # (to prevent a mass selection from trying
         # to update the property model hundreds of times)
         self.show_property_id = None
         self.show_property_type = None
-        self.show_property_timer = QTimer()
+        self.show_property_timer = QTimer(self)
         self.show_property_timer.setInterval(100)
         self.show_property_timer.setSingleShot(True)
         self.show_property_timer.timeout.connect(self.show_property_timeout)
+
+        # Selection timer
+        # Timer to use a delay before emitting selection signal
+        # (to prevent a mass selection from trying
+        # to update the zoom slider widget hundreds of times)
+        self.selection_timer = QTimer(self)
+        self.selection_timer.setInterval(100)
+        self.selection_timer.setSingleShot(True)
+        self.selection_timer.timeout.connect(self.emit_selection_signal)
 
         # Setup video preview QWidget
         self.videoPreview = VideoWidget()
         self.tabVideo.layout().insertWidget(0, self.videoPreview)
 
         # Load window state and geometry
+        self.saved_state = None
+        self.saved_geometry = None
         self.load_settings()
 
         # Setup Cache settings
@@ -2886,69 +2970,74 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         self.preview_parent = PreviewParent()
         self.preview_parent.Init(self, self.timeline_sync.timeline, self.videoPreview)
         self.preview_thread = self.preview_parent.worker
+        self.sliderZoomWidget.connect_playback()
 
         # Set pause callback
         self.PauseSignal.connect(self.handlePausedVideo)
 
         # QTimer for Autosave
+        minutes = 1000 * 60
         self.auto_save_timer = QTimer(self)
-        self.auto_save_timer.setInterval(int(s.get("autosave-interval") * 1000 * 60))
+        self.auto_save_timer.setInterval(
+            int(s.get("autosave-interval") * minutes))
         self.auto_save_timer.timeout.connect(self.auto_save_project)
         if s.get("enable-auto-save"):
             self.auto_save_timer.start()
 
+        lib_settings = openshot.Settings.Instance()
+
         # Set encoding method
         if s.get("hw-decoder"):
-            openshot.Settings.Instance().HARDWARE_DECODER = int(str(s.get("hw-decoder")))
+            lib_settings.HARDWARE_DECODER = int(str(s.get("hw-decoder")))
         else:
-            openshot.Settings.Instance().HARDWARE_DECODER = 0
+            lib_settings.HARDWARE_DECODER = 0
 
         # Set graphics card for decoding
         if s.get("graca_number_de"):
-            if int(str(s.get("graca_number_de"))) != 0:
-                openshot.Settings.Instance().HW_DE_DEVICE_SET = int(str(s.get("graca_number_de")))
-            else:
-                openshot.Settings.Instance().HW_DE_DEVICE_SET = 0
+            lib_settings.HW_DE_DEVICE_SET = int(
+                str(s.get("graca_number_de")))
         else:
-            openshot.Settings.Instance().HW_DE_DEVICE_SET = 0
+            lib_settings.HW_DE_DEVICE_SET = 0
 
         # Set graphics card for encoding
         if s.get("graca_number_en"):
-            if int(str(s.get("graca_number_en"))) != 0:
-                openshot.Settings.Instance().HW_EN_DEVICE_SET = int(str(s.get("graca_number_en")))
-            else:
-                openshot.Settings.Instance().HW_EN_DEVICE_SET = 0
+                lib_settings.HW_EN_DEVICE_SET = int(
+                    str(s.get("graca_number_en")))
         else:
-            openshot.Settings.Instance().HW_EN_DEVICE_SET = 0
+            lib_settings.HW_EN_DEVICE_SET = 0
 
         # Set audio playback settings
         if s.get("playback-audio-device"):
-            openshot.Settings.Instance().PLAYBACK_AUDIO_DEVICE_NAME = str(s.get("playback-audio-device"))
+            lib_settings.PLAYBACK_AUDIO_DEVICE_NAME = str(s.get("playback-audio-device"))
         else:
-            openshot.Settings.Instance().PLAYBACK_AUDIO_DEVICE_NAME = ""
+            lib_settings.PLAYBACK_AUDIO_DEVICE_NAME = ""
 
         # Set scaling mode to lower quality scaling (for faster previews)
-        openshot.Settings.Instance().HIGH_QUALITY_SCALING = False
+        lib_settings.HIGH_QUALITY_SCALING = False
 
         # Set use omp threads number environment variable
         if s.get("omp_threads_number"):
-            openshot.Settings.Instance().OMP_THREADS = max(2, int(str(s.get("omp_threads_number"))))
+            lib_settings.OMP_THREADS = max(
+                2, int(str(s.get("omp_threads_number"))))
         else:
-            openshot.Settings.Instance().OMP_THREADS = 12
+            lib_settings.OMP_THREADS = 12
 
         # Set use ffmpeg threads number environment variable
         if s.get("ff_threads_number"):
-            openshot.Settings.Instance().FF_THREADS = max(1, int(str(s.get("ff_threads_number"))))
+            lib_settings.FF_THREADS = max(
+                1, int(str(s.get("ff_threads_number"))))
         else:
-            openshot.Settings.Instance().FF_THREADS = 8
+            lib_settings.FF_THREADS = 8
 
         # Set use max width decode hw environment variable
         if s.get("decode_hw_max_width"):
-            openshot.Settings.Instance().DE_LIMIT_WIDTH_MAX = int(str(s.get("decode_hw_max_width")))
+            lib_settings.DE_LIMIT_WIDTH_MAX = int(
+                str(s.get("decode_hw_max_width")))
 
         # Set use max height decode hw environment variable
         if s.get("decode_hw_max_height"):
-            openshot.Settings.Instance().DE_LIMIT_HEIGHT_MAX = int(str(s.get("decode_hw_max_height")))
+            lib_settings.DE_LIMIT_HEIGHT_MAX = int(
+                str(s.get("decode_hw_max_height")))
 
         # Create lock file
         self.create_lock_file()
@@ -2956,14 +3045,21 @@ class MainWindow(updates.UpdateWatcher, QMainWindow):
         # Connect OpenProject Signal
         self.OpenProjectSignal.connect(self.open_project)
 
+        # Connect Selection signals
+        self.SelectionAdded.connect(self.addSelection)
+        self.SelectionRemoved.connect(self.removeSelection)
+
         # Show window
-        if self.mode != "unittest":
-            self.show()
-        else:
-            log.info('Hiding UI for unittests')
+        self.show()
 
         # Create tutorial manager
         self.tutorial_manager = TutorialManager(self)
+
+        # Apply saved window geometry/state from settings
+        if self.saved_geometry:
+            self.restoreGeometry(self.saved_geometry)
+        if self.saved_state:
+            self.restoreState(self.saved_state)
 
         # Save settings
         s.save()

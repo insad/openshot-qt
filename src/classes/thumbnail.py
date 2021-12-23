@@ -34,6 +34,7 @@ from threading import Thread
 from classes import info
 from classes.query import File
 from classes.logger import log
+from classes.app import get_app
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -52,6 +53,11 @@ def GenerateThumbnail(file_path, thumb_path, thumbnail_frame, width, height, mas
     # Create a clip object and get the reader
     clip = openshot.Clip(file_path)
     reader = clip.Reader()
+    scale = get_app().devicePixelRatio()
+
+    if scale > 1.0:
+        clip.scale_x.AddPoint(1.0, 1.0 * scale)
+        clip.scale_y.AddPoint(1.0, 1.0 * scale)
 
     # Open reader
     reader.Open()
@@ -73,7 +79,7 @@ def GenerateThumbnail(file_path, thumb_path, thumbnail_frame, width, height, mas
         os.mkdir(parent_path)
 
     # Save thumbnail image and close readers
-    reader.GetFrame(thumbnail_frame).Thumbnail(thumb_path, width, height, mask, overlay, "#000", False, "png", 85, rotate)
+    reader.GetFrame(thumbnail_frame).Thumbnail(thumb_path, round(width * scale), round(height * scale), mask, overlay, "#000", False, "png", 85, rotate)
     reader.Close()
     clip.Close()
 
@@ -127,7 +133,7 @@ class httpThumbnailHandler(BaseHTTPRequestHandler):
 
     def log_error(self, msg_format, *args):
         """ Log error from HTTPServer """
-        log.error(msg_format % args)
+        log.warning(msg_format % args)
 
     def do_GET(self):
         """ Process each GET request and return a value (image or file path)"""
@@ -203,13 +209,13 @@ class httpThumbnailHandler(BaseHTTPRequestHandler):
 
         # Send message back to client
         if os.path.exists(thumb_path):
-            if not only_path:
-                self.wfile.write(open(thumb_path, 'rb').read())
-            else:
+            if only_path:
                 self.wfile.write(bytes(thumb_path, "utf-8"))
+            else:
+                with open(thumb_path, 'rb') as f:
+                    self.wfile.write(f.read())
 
         # Pause processing of request (since we don't currently use thread pooling, this allows
         # the threads to be processed without choking the CPU as much
         # TODO: Make HTTPServer work with a limited thread pool and remove this sleep() hack.
         time.sleep(0.01)
-

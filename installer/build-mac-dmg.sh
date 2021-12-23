@@ -42,6 +42,9 @@ mv "$OS_PATH/MacOS/qt.conf" "$OS_PATH/Resources/qt.conf"; ln -s "../Resources/qt
 mv "$OS_PATH/MacOS/openshot-qt.hqx" "$OS_PATH/Resources/openshot-qt.hqx"; ln -s "../Resources/openshot-qt.hqx" "$OS_PATH/MacOS/openshot-qt.hqx";
 mv "$OS_PATH/MacOS/lib/launch.py" "$OS_PATH/Resources/launch.py"; ln -s "../../Resources/launch.py" "$OS_PATH/MacOS/lib/launch.py";
 
+echo "Fix permissions inside MacOS folder (all everyone to read and execute all the files inside this *.app bundle)"
+chmod -R a+rx "$OS_PATH/"*
+
 echo "Loop through bundled files and sign all binary files"
 find "build" \( -iname '*.dylib' -o -iname '*.so' \) -exec codesign -s "OpenShot Studios, LLC" --timestamp=http://timestamp.apple.com/ts01 --entitlements "installer/openshot.entitlements" --force "{}" \;
 
@@ -69,6 +72,11 @@ pat='RequestUUID = (.*)'
 [[ "$notarize_output" =~ $pat ]]
 REQUEST_UUID="${BASH_REMATCH[1]}"
 echo " RequestUUID Found: $REQUEST_UUID"
+
+if [ "$REQUEST_UUID" == "" ]; then
+    echo "Failed to locate REQUEST_UUID, exiting with error."
+    exit 1
+fi
 
 echo "Check Notarization Progress... (list recent notarization records)"
 xcrun altool --notarization-history 0 -u "jonathan@openshot.org" -p "@keychain:NOTARIZE_AUTH" | head -n 10

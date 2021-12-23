@@ -32,6 +32,7 @@ import re
 from functools import partial
 
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QDialog
 
 from classes import info, ui_util
@@ -116,6 +117,10 @@ class About(QDialog):
         self.app = get_app()
         _ = self.app._tr
 
+        # Load logo banner (using display DPI)
+        icon = QIcon(":/about/AboutLogo.png")
+        self.lblAboutLogo.setPixmap(icon.pixmap(icon.availableSizes()[0]))
+
         # Hide chnagelog button by default
         self.btnchangelog.setVisible(False)
 
@@ -139,17 +144,16 @@ class About(QDialog):
             'current_year': str(datetime.datetime.today().year)
             }
         about_html = '''
-            <html><head/><body><hr/>
-            <p align="center">
-            <span style=" font-size:10pt; font-weight:600;">%s</span>
-            </p>
-            <p align="center">
-            <span style=" font-size:10pt;">%s </span>
-            <a href="https://www.openshot.org/%s?r=about-us">
-                <span style=" font-size:10pt; text-decoration: none; color:#55aaff;">%s</span>
-            </a>
-            <span style=" font-size:10pt;">.</span>
-            </p>
+            <html><head/><body style="padding:24px 0;"><hr/>
+            <div align="center" style="margin:12px 0;">
+              <p style="font-size:10pt;font-weight:600;margin-bottom:18px;">
+                %s
+              </p>
+              <p style="font-size:10pt;margin-bottom:12px;">%s
+                <a href="https://www.openshot.org/%s?r=about-us"
+                   style="text-decoration:none;">%s</a>.
+              </p>
+            </div>
             </body></html>
             ''' % (
                 create_text,
@@ -158,15 +162,13 @@ class About(QDialog):
                 learnmore_text)
         company_html = '''
             <html><head/>
-            <body style="font-size:11pt; font-weight:400; font-style:normal;">
+            <body style="font-size:10pt;font-weight:400;font-style:normal;padding:24px 0;">
             <hr />
-            <p align="center"
-               style="margin:12px 12px 0 0; -qt-block-indent:0; text-indent:0;">
-               <span style="font-size:10pt; font-weight:600;">%s </span>
-               <a href="http://www.openshotstudios.com?r=about-us">
-               <span style="font-size:10pt; font-weight:600; text-decoration: none; color:#55aaff;">
-               OpenShot Studios, LLC<br /></span></a>
-            </p>
+            <div style="margin:12px 0;font-weight:600;" align="center">
+              %s
+              <a href="http://www.openshotstudios.com?r=about-us"
+                 style="text-decoration:none;">OpenShot Studios, LLC</a><br/>
+            </div>
             </body></html>
             ''' % (copyright_text)
 
@@ -278,9 +280,7 @@ class Credits(QDialog):
         supporter_html = '''
             <html><head/><body>
             <p align="center">
-                <a href="https://www.openshot.org/%sdonate/?app-about-us">
-                <span style="text-decoration: underline; color:#55aaff;">%s</span>
-                </a>
+              <a href="https://www.openshot.org/%sdonate/?app-about-us">%s</a>
             </p>
             </body></html>
             ''' % (info.website_language(), supporter_text)
@@ -313,12 +313,13 @@ class Credits(QDialog):
             for row in translator_rows:
                 # Split each row into 2 parts (name and username)
                 translator_parts = row.split("https://launchpad.net/")
-                name = translator_parts[0].strip()
-                username = translator_parts[1].strip()
-                translator_credits.append({
-                    "name": name,
-                    "website": "https://launchpad.net/%s" % username
-                    })
+                if len(translator_parts) >= 2:
+                    name = translator_parts[0].strip()
+                    username = translator_parts[1].strip()
+                    translator_credits.append({
+                        "name": name,
+                        "website": "https://launchpad.net/%s" % username
+                        })
 
             # Add translators listview
             self.translatorsListView = CreditsTreeView(
@@ -396,9 +397,7 @@ class Changelog(QDialog):
         github_html = '''
             <html><head/><body>
             <p align="center">
-                <a href="https://github.com/OpenShot/">
-                <span style=" text-decoration: underline; color:#55aaff;">%s</span>
-                </a>
+                <a href="https://github.com/OpenShot/">%s</a>
             </p>
             </body></html>
             ''' % (github_text)

@@ -36,9 +36,9 @@ from PyQt5.QtWidgets import (
     QPushButton, QToolButton, QCheckBox,
 )
 from classes.logger import log
-from classes.settings import get_settings
 from classes.app import get_app
 from classes.metrics import track_metric_screen
+from classes import sentry
 
 
 class TutorialDialog(QWidget):
@@ -53,7 +53,12 @@ class TutorialDialog(QWidget):
 
         painter.setPen(QPen(frameColor, 2))
         painter.setBrush(self.palette().color(QPalette.Window))
-        painter.drawRoundedRect(QRectF(31, 0, self.width() - 31, self.height()), 10, 10)
+        painter.drawRoundedRect(
+            QRectF(31, 0,
+                   self.width() - 31,
+                   self.height()
+                   ),
+            10, 10)
 
         # Paint blue triangle (if needed)
         if self.arrow:
@@ -61,22 +66,25 @@ class TutorialDialog(QWidget):
             path = QPainterPath()
             path.moveTo(0, 35)
             path.lineTo(31, 35 - arrow_height)
-            path.lineTo(31, (35 - arrow_height) + (arrow_height * 2))
+            path.lineTo(
+                31, int((35 - arrow_height) + (arrow_height * 2)))
             path.lineTo(0, 35)
             painter.fillPath(path, frameColor)
 
     def checkbox_metrics_callback(self, state):
         """ Callback for error and anonymous usage checkbox"""
-        s = get_settings()
+        s = get_app().get_settings()
         if state == Qt.Checked:
             # Enabling metrics sending
             s.set("send_metrics", True)
+            sentry.init_tracing()
 
             # Opt-in for metrics tracking
             track_metric_screen("metrics-opt-in")
         else:
             # Opt-out for metrics tracking
             track_metric_screen("metrics-opt-out")
+            sentry.disable_tracing()
 
             # Disable metric sending
             s.set("send_metrics", False)
@@ -118,7 +126,7 @@ class TutorialDialog(QWidget):
         # probably okay for now.
         if self.widget_id == "0":
             # Get settings
-            s = get_settings()
+            s = get_app().get_settings()
 
             # create spinner
             checkbox_metrics = QCheckBox()
@@ -178,7 +186,7 @@ class TutorialManager(object):
 
         # If a tutorial is already visible, just update it
         if self.current_dialog:
-            # XXX: Respond to possible dock floats/moves
+            # Respond to possible dock floats/moves
             self.dock.raise_()
             self.re_position_dialog()
             return
@@ -197,7 +205,9 @@ class TutorialManager(object):
 
             # Create tutorial
             self.position_widget = tutorial_object
-            self.offset = QPoint(tutorial_details["x"], tutorial_details["y"])
+            self.offset = QPoint(
+                int(tutorial_details["x"]),
+                int(tutorial_details["y"]))
             tutorial_dialog = TutorialDialog(tutorial_id, tutorial_details["text"], tutorial_details["arrow"], self)
 
             # Connect signals
@@ -260,7 +270,7 @@ class TutorialManager(object):
 
     def hide_tips(self, tid, user_clicked=False):
         """ Hide the current tip, and don't show anymore """
-        s = get_settings()
+        s = get_app().get_settings()
 
         # Loop through and find current tid
         for tutorial_object in self.tutorial_objects:
@@ -334,8 +344,8 @@ class TutorialManager(object):
             position = self.position_widget.mapToGlobal(pos_rect.bottomRight())
 
             # Move tutorial widget to the correct position
-            self.re_show_dialog()
             self.dock.move(position)
+            self.re_show_dialog()
 
     def __init__(self, win):
         """ Constructor """
@@ -348,7 +358,7 @@ class TutorialManager(object):
         _ = app._tr
 
         # get settings
-        s = get_settings()
+        s = app.get_settings()
         self.tutorial_enabled = s.get("tutorial_enabled")
         self.tutorial_ids = s.get("tutorial_ids").split(",")
 

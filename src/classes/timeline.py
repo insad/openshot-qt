@@ -31,7 +31,6 @@ import openshot  # Python module for libopenshot (required video editing module 
 from classes.updates import UpdateInterface
 from classes.logger import log
 from classes.app import get_app
-from classes import settings
 
 
 class TimelineSync(UpdateInterface):
@@ -41,7 +40,6 @@ class TimelineSync(UpdateInterface):
         self.app = get_app()
         self.window = window
         project = self.app.project
-        s = settings.get_settings()
 
         # Get some settings from the project
         fps = project.get("fps")
@@ -110,8 +108,9 @@ class TimelineSync(UpdateInterface):
         # Clear timeline preview cache (since our video size has changed)
         self.timeline.ClearAllCache()
 
-        # Set new max video size (Based on preview widget size)
-        self.timeline.SetMaxSize(new_size.width(), new_size.height())
+        # Set new max video size (Based on preview widget size and display scaling)
+        scale = self.window.devicePixelRatioF()
+        self.timeline.SetMaxSize(round(new_size.width() * scale), round(new_size.height() * scale))
 
         # Refresh current frame (since the entire timeline was updated)
         self.window.refreshFrameSignal.emit()

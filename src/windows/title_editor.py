@@ -42,12 +42,12 @@ from PyQt5 import QtGui
 from PyQt5.QtWidgets import (
     QWidget, QGraphicsScene,
     QMessageBox, QDialog, QColorDialog, QFontDialog,
-    QPushButton, QTextEdit, QLabel
+    QPushButton, QLineEdit, QLabel
 )
 
 import openshot
 
-from classes import info, ui_util, settings
+from classes import info, ui_util
 from classes.logger import log
 from classes.app import get_app
 from classes.metrics import track_metric_screen
@@ -137,8 +137,8 @@ class TitleEditor(QDialog):
         # Loop through child widgets (and remove them)
         text_list = []
         for child in self.settingsContainer.children():
-            if type(child) == QTextEdit and child.objectName() != "txtFileName":
-                text_list.append(child.toPlainText())
+            if type(child) == QLineEdit and child.objectName() != "txtFileName":
+                text_list.append(child.text())
 
         # Update text values in the SVG
         for i, node in enumerate(self.tspan_nodes):
@@ -161,31 +161,29 @@ class TitleEditor(QDialog):
         clip = openshot.Clip(self.filename)
         reader = clip.Reader()
 
+        # Scale preview for high DPI display (if any)
+        scale = get_app().devicePixelRatio()
+        if scale > 1.0:
+            clip.scale_x.AddPoint(1.0, 1.0 * scale)
+            clip.scale_y.AddPoint(1.0, 1.0 * scale)
+
         # Open reader
         reader.Open()
 
         # Overwrite temp file with thumbnail image and close readers
         reader.GetFrame(1).Thumbnail(
             tmp_filename,
-            self.graphicsView.width(),
-            self.graphicsView.height(),
+            round(self.lblPreviewLabel.width() * scale),
+            round(self.lblPreviewLabel.height() * scale),
             "", "", "#000", False, "png", 85, 0.0)
         reader.Close()
         clip.Close()
 
         # Attempt to load saved thumbnail
-        svg = QtGui.QPixmap()
-        if not svg.load(tmp_filename):
-            log.error("Couldn't load title preview from {}".format(tmp_filename))
-            return
+        display_pixmap = QtGui.QIcon(tmp_filename).pixmap(self.lblPreviewLabel.size())
 
         # Display temp image
-        scene = QGraphicsScene(self)
-        view = self.graphicsView
-        svg_scaled = svg.scaled(self.graphicsView.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        scene.addPixmap(svg_scaled)
-        view.setScene(scene)
-        view.show()
+        self.lblPreviewLabel.setPixmap(display_pixmap)
 
         # Remove temporary file
         os.unlink(tmp_filename)
@@ -238,7 +236,7 @@ class TitleEditor(QDialog):
         label.setToolTip(label_line_text)
 
         # create text editor for file name
-        self.txtFileName = QTextEdit(self)
+        self.txtFileName = QLineEdit(self)
         self.txtFileName.setObjectName("txtFileName")
 
         # If edit mode or reload, set file name
@@ -302,7 +300,7 @@ class TitleEditor(QDialog):
             label.setToolTip(label_line_text)
 
             # create text editor for each text element in title
-            widget = QTextEdit(_(text))
+            widget = QLineEdit(_(text))
             widget.setFixedHeight(28)
             widget.textChanged.connect(functools.partial(self.txtLine_changed, widget))
             layout.addRow(label, widget)
@@ -581,10 +579,10 @@ class TitleEditor(QDialog):
 
         else:
             # Create new title (with unique name)
-            file_name = "%s.svg" % self.txtFileName.toPlainText().strip()
+            file_name = "%s.svg" % self.txtFileName.text().strip()
             file_path = os.path.join(info.TITLE_PATH, file_name)
 
-            if self.txtFileName.toPlainText().strip():
+            if self.txtFileName.text().strip():
                 # Do we have unsaved changes?
                 if os.path.exists(file_path) and not self.edit_file_path:
                     ret = QMessageBox.question(
@@ -611,10 +609,10 @@ class TitleEditor(QDialog):
     def btnAdvanced_clicked(self):
         """Use an external editor to edit the image"""
         # Get editor executable from settings
-        s = settings.get_settings()
+        s = get_app().get_settings()
         prog = s.get("title_editor")
         # Store filename field to display on reload
-        filename_text = self.txtFileName.toPlainText().strip()
+        filename_text = self.txtFileName.text().strip()
         try:
             # launch advanced title editor
             log.info("Advanced title editor command: %s", str([prog, self.filename]))

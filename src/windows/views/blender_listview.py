@@ -47,11 +47,10 @@ from PyQt5.QtWidgets import (
     QApplication, QListView, QMessageBox,
     QComboBox, QDoubleSpinBox, QLabel, QPushButton, QLineEdit, QPlainTextEdit,
 )
-from PyQt5.QtGui import QColor, QImage, QPixmap
+from PyQt5.QtGui import QColor, QImage, QPixmap, QIcon
 
 from classes import info
 from classes.logger import log
-from classes import settings
 from classes.query import File
 from classes.app import get_app
 
@@ -498,7 +497,7 @@ class BlenderListView(QListView):
     def error_with_blender(self, version=None, worker_message=None):
         """ Show a friendly error message regarding the blender executable or version. """
         _ = self.app._tr
-        s = settings.get_settings()
+        s = self.app.get_settings()
 
         error_message = ""
         if version:
@@ -546,7 +545,7 @@ Blender Path: {}
         user_params += "\n#END INJECTING PARAMS\n"
 
         # If GPU rendering is selected, see if GPU enable code is available
-        s = settings.get_settings()
+        s = self.app.get_settings()
         gpu_code_body = None
         if s.get("blender_gpu_enabled"):
             gpu_enable_py = os.path.join(info.PATH, "blender", "scripts", "gpu_enable.py.in")
@@ -577,15 +576,11 @@ Blender Path: {}
 
     @pyqtSlot(str)
     def update_image(self, image_path):
-
-        # get the pixbuf
-        image = QImage(image_path)
-        scaled_image = image.scaled(
-            self.win.imgPreview.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation)
-        pixmap = QPixmap.fromImage(scaled_image)
-        self.win.imgPreview.setPixmap(pixmap)
+        # Scale preview for high DPI display (if any)
+        scale = get_app().devicePixelRatio()
+        display_pixmap = QIcon(image_path).pixmap(self.win.imgPreview.size())
+        display_pixmap.setDevicePixelRatio(scale)
+        self.win.imgPreview.setPixmap(display_pixmap)
 
     def Cancel(self):
         """Cancel the current render, if any"""
@@ -684,8 +679,8 @@ Blender Path: {}
 
         # Setup header columns
         self.setModel(self.blender_model.model)
-        self.setIconSize(QSize(131, 108))
-        self.setGridSize(QSize(102, 92))
+        self.setIconSize(info.LIST_ICON_SIZE)
+        self.setGridSize(info.LIST_GRID_SIZE)
         self.setViewMode(QListView.IconMode)
         self.setResizeMode(QListView.Adjust)
         self.setUniformItemSizes(True)
@@ -724,7 +719,7 @@ class Worker(QObject):
         self.target_script = target_script
         self.preview_frame = preview_frame
 
-        s = settings.get_settings()
+        s = get_app().get_settings()
         self.blender_exec_path = s.get("blender_command")
 
         # Init regex expression used to determine blender's render progress
@@ -906,8 +901,8 @@ class Worker(QObject):
             if self.canceled:
                 return
             if self.frame_count < 1:
-                log.error("No frame detected from Blender!")
-                log.error("Blender output:\n{}".format(
+                log.warning("No frame detected from Blender!")
+                log.warning("Blender output:\n{}".format(
                     self.command_output))
                 # Show Error that no frames are detected.  This is likely caused by
                 # the wrong command being executed... or an error in Blender.
